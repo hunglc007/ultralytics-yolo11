@@ -10,18 +10,20 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.nn import functional as F
+from pathlib import Path
+from copy import deepcopy
+import json
 
 from ultralytics.data.utils import polygons2masks, polygons2masks_overlap
 from ultralytics.utils import LOGGER, colorstr
 from ultralytics.utils.checks import check_version
 from ultralytics.utils.instance import Instances
-from ultralytics.utils.metrics import bbox_ioa
+from ultralytics.utils.metrics import bbox_ioa, bbox_iou
 from ultralytics.utils.ops import segment2box, xywh2xyxy, xyxyxyxy2xywhr
 from ultralytics.utils.torch_utils import TORCHVISION_0_10, TORCHVISION_0_11, TORCHVISION_0_13
 
 DEFAULT_MEAN = (0.0, 0.0, 0.0)
 DEFAULT_STD = (1.0, 1.0, 1.0)
-
 
 class BaseTransform:
     """
@@ -486,6 +488,141 @@ class BaseMixTransform:
             label["texts"] = mix_texts
         return labels
 
+class Replace(BaseMixTransform):
+    def __init__(self, dataset, imgsz=640, p=0.5):
+        assert 0 <= p <= 1.0, f"The probability should be in range [0, 1], but got {p}."
+        super().__init__(dataset=dataset, p=p)
+        self.imgsz = imgsz
+        self.max_samples = 20
+        self.img_name_dict = {}
+        for index, label in enumerate(self.dataset.labels):
+            self.img_name_dict[Path(label["im_file"]).stem] = index
+        with open(Path(__file__).parent.parent.parent / "object_index.json", "r") as f:
+            self.object_index = json.load(f)
+
+    def __call__(self, labels):
+        im_name = Path(labels["im_file"]).stem
+        if random.uniform(0, 1) > self.p:
+            return labels
+        if im_name[:6] != "camera":
+            return labels
+        # Get index of one or three other images
+        labels = deepcopy(labels)
+        indexes = self.get_indexes(im_name)
+        if isinstance(indexes, int):
+            indexes = [indexes]
+
+        if len(indexes) == 0:
+            return labels
+
+        # Get images information will be used for Mosaic, CutMix or MixUp
+        mix_labels = [self.dataset.get_image_and_label(i) for i in indexes]
+        labels["mix_labels"] = mix_labels
+
+        # Update cls and texts
+        labels = self._update_label_text(labels)
+        # Mosaic, CutMix or MixUp
+        labels = self._mix_transform(labels)
+        labels.pop("mix_labels", None)
+        return labels
+
+    def get_indexes(self, im_file):
+        cam_id, time_seg, index = im_file.split('_')
+        pool = self.object_index.get(cam_id + "_" + time_seg, [])
+        center = int(index)
+        pool_indices = [p[-1] for p in pool]
+        max_pool_idx = max(pool_indices)
+        min_pool_idx = min(pool_indices)
+        min_idx = max(min_pool_idx, center - 50)
+        max_idx = min(max_pool_idx, center + 50)
+        filtered_pool = [
+            p for p in pool
+            if min_idx <= int(p[-1]) <= max_idx and not (center - 5 <= int(p[-1]) <= center + 5)
+        ]
+        sampled = random.sample(filtered_pool, min(self.max_samples, len(filtered_pool))) if filtered_pool else []
+        list_indexes = []
+        for sample in sampled:
+            img_name = sample[0]
+            if img_name not in self.img_name_dict:
+                continue
+            list_indexes.append(self.img_name_dict[img_name])
+        return list_indexes
+
+    def _mix_transform(self, labels):
+        h0, w0 = labels['ori_shape']
+        pool = []
+        image_refs = {}
+        image_id_counter = 0
+        img = labels['img']
+
+        for mix in labels['mix_labels']:
+            h, w = mix['ori_shape']
+            if h != h0 or w != w0: continue
+            img_id = image_id_counter
+            image_refs[img_id] = mix['img']  # lưu ảnh một lần
+            image_id_counter += 1
+            for bbox, cls in zip(mix['instances'].bboxes, mix['cls'].squeeze(-1)):
+                pool.append((bbox, int(cls), img_id))
+        if not pool:
+            return labels
+        random.shuffle(pool)
+        cur_bboxes = labels['instances'].bboxes
+        for bbox, cls, img_id in pool:
+            cx, cy, bw, bh = bbox.tolist()
+
+            # Determine the probability of adding the object based on its size
+            if bw > 50/1080 and bh > 50/1080:
+                add_probability = 0.5
+            elif 40/1080 < bw <= 50/1080 and 40/1080 < bh <= 50/1080:
+                add_probability = 0.65
+            elif 30/1080 < bw <= 40/1080 and 30/1080 < bh <= 40/1080:
+                add_probability = 0.8
+            else:
+                add_probability = 1.0
+
+            # Skip adding the object based on the probability
+            if random.random() > add_probability:
+                continue
+
+            ioa = bbox_ioa(xywh2xyxy(bbox)[None], xywh2xyxy(cur_bboxes), iou=True)
+            if ioa.sum() == 0:
+
+
+                mix_img = image_refs[img_id]
+                h_img, w_img = mix_img.shape[:2]
+                x1 = cx - bw / 2
+                y1 = cy - bh / 2
+                x2 = cx + bw / 2
+                y2 = cy + bh / 2
+
+                x1 = int(x1 * w_img)
+                y1 = int(y1 * h_img)
+                x2 = int(x2 * w_img)
+                y2 = int(y2 * h_img)
+
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                crop = mix_img[y1:y2, x1:x2, :]
+                ch, cw = crop.shape[:2]
+                if ch == 0 or cw == 0 or y2 > h_img or x2 > w_img:
+                    continue  # skip invalid crop or paste out-of-bound
+
+                # Paste into current image
+                img[y1:y2, x1:x2, :] = crop  # override pixels
+
+                ref_seg = labels['instances'].segments
+                empty_seg = np.zeros((1,) + ref_seg.shape[1:], dtype=ref_seg.dtype)
+
+                new_inst = Instances(bboxes = bbox[None], segments = empty_seg, keypoints = None, normalized = True)
+                labels['instances'] = Instances.concatenate([labels['instances'], new_inst], axis=0)
+                labels['instances'].segments = labels['instances'].segments[:-1]
+                # cập nhật nhãn
+                labels['cls'] = np.concatenate([labels['cls'], np.array([[cls]])], axis=0)
+                cur_bboxes = labels['instances'].bboxes
+        labels['img'] = img
+        return labels
+
 
 class Mosaic(BaseMixTransform):
     """
@@ -517,7 +654,7 @@ class Mosaic(BaseMixTransform):
         >>> augmented_labels = mosaic_aug(original_labels)
     """
 
-    def __init__(self, dataset, imgsz=640, p=1.0, n=4):
+    def __init__(self, dataset, imgsz=640, p=1.0, n=4, pre_transform=None):
         """
         Initializes the Mosaic augmentation object.
 
@@ -542,6 +679,7 @@ class Mosaic(BaseMixTransform):
         self.border = (-imgsz // 2, -imgsz // 2)  # width, height
         self.n = n
         self.buffer_enabled = self.dataset.cache != "ram"
+        self.pre_transform = pre_transform
 
     def get_indexes(self):
         """
@@ -1015,7 +1153,7 @@ class CutMix(BaseMixTransform):
         h, w = labels["img"].shape[:2]
 
         cut_areas = np.asarray([self._rand_bbox(w, h) for _ in range(self.num_areas)], dtype=np.float32)
-        ioa1 = bbox_ioa(cut_areas, labels["instances"].bboxes)  # (self.num_areas, num_boxes)
+        ioa1 = (cut_areas, labels["instances"].bboxes)  # (self.num_areas, num_boxes)
         idx = np.nonzero(ioa1.sum(axis=1) <= 0)[0]
         if len(idx) == 0:
             return labels
@@ -2505,7 +2643,11 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
         >>> transforms = v8_transforms(dataset, imgsz=640, hyp=hyp)
         >>> augmented_data = transforms(dataset[0])
     """
-    mosaic = Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic)
+    flip_idx = dataset.data.get("flip_idx", [])  # for keypoints augmentation
+    replace = Replace(dataset, imgsz=imgsz, p=hyp.replace)
+    fisheys_transform = Compose([replace, RandomFlip(direction="vertical", p=hyp.flipud),
+            RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx)])
+
     affine = RandomPerspective(
         degrees=hyp.degrees,
         translate=hyp.translate,
@@ -2514,8 +2656,11 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
         perspective=hyp.perspective,
         pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
     )
-
-    pre_transform = Compose([mosaic, affine])
+    if hyp.mosaic > 0.0:
+        mosaic = Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic, pre_transform=fisheys_transform)
+        pre_transform = Compose([fisheys_transform, mosaic, affine])
+    else:
+        pre_transform = Compose([fisheys_transform, affine])
     if hyp.copy_paste_mode == "flip":
         pre_transform.insert(1, CopyPaste(p=hyp.copy_paste, mode=hyp.copy_paste_mode))
     else:
@@ -2527,7 +2672,7 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
                 mode=hyp.copy_paste_mode,
             )
         )
-    flip_idx = dataset.data.get("flip_idx", [])  # for keypoints augmentation
+
     if dataset.use_keypoints:
         kpt_shape = dataset.data.get("kpt_shape", None)
         if len(flip_idx) == 0 and hyp.fliplr > 0.0:
@@ -2543,8 +2688,6 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
             CutMix(dataset, pre_transform=pre_transform, p=hyp.cutmix),
             Albumentations(p=1.0),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
-            RandomFlip(direction="vertical", p=hyp.flipud),
-            RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
         ]
     )  # transforms
 

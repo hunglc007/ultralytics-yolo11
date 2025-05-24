@@ -107,11 +107,17 @@ def inplace_object_augment(img, labels, pool, index, image_cache, max_samples=50
         if any(iou([x1,y1,x2,y2], box) > 0 for box in current_boxes):
             continue
         obj_img = image_cache.get(img_path)
+        w_img, h_img = obj_img.shape[:2]
+        if w_img != w or h_img != h:
+            continue
         if obj_img is None:
             continue
         patch = obj_img[y1:y2, x1:x2]
-        if patch.size == 0:
+
+        # Validate the bounding box and patch dimensions
+        if patch.shape[0] == 0 or patch.shape[1] == 0:
             continue
+
         img[y1:y2, x1:x2] = patch
         new_labels.append([cls, x1, y1, x2, y2])
         current_boxes.append([x1, y1, x2, y2])
@@ -131,6 +137,13 @@ def main():
     output_folder = Path('/media/hungdv/Source/Data/AICity2025/yolo_format/augmented')
     output_folder.mkdir(exist_ok=True)
 
+    # Create output directories
+    output_folder = Path('/media/hungdv/Source/Data/AICity2025/yolo_format/augmented')
+    output_images_folder = output_folder / 'images'
+    output_labels_folder = output_folder / 'labels'
+    output_images_folder.mkdir(parents=True, exist_ok=True)
+    output_labels_folder.mkdir(parents=True, exist_ok=True)
+
     image_cache = ImageCache(max_size=2000)
 
     image_paths = list(image_folder.glob('*.png'))
@@ -138,6 +151,13 @@ def main():
     for img_path in tqdm(image_paths, desc="Processing images", dynamic_ncols=True, total=len(image_paths)):
         img_name = img_path.name
         label_name = img_name.replace('.png', '.txt')
+
+        # # Check if the augmented image already exists
+        # output_img_path = output_images_folder / f"{img_name.replace('.png', '_aug.png')}"
+        # output_label_path = output_labels_folder / f"{label_name.replace('.txt', '_aug.txt')}"
+        # if output_img_path.exists() and output_label_path.exists():
+        #     print(f"Skipping {img_name}, already processed.")
+        #     continue
 
         img = image_cache.get(str(img_path))
         h, w = img.shape[:2]
@@ -166,32 +186,25 @@ def main():
         img_aug, new_labels = inplace_object_augment(img.copy(), labels, pool, index, image_cache, max_samples=500)
         combined_img = cv2.hconcat([img, img_aug])
 
-        # # Save the augmented image
-        # output_path = output_folder / img_name
-        # cv2.imwrite(str(output_path), combined_img)
-        # # print(f"Augmented image saved to {output_path}")
+        # Save the augmented image
+        output_path = output_folder / img_name
+        cv2.imwrite(str(output_path), combined_img)
+        # print(f"Augmented image saved to {output_path}")
 
-        # Create output directories
-        output_folder = Path('/media/hungdv/Source/Data/AICity2025/yolo_format/aug_fisheye')
-        output_images_folder = output_folder / 'images'
-        output_labels_folder = output_folder / 'labels'
-        output_images_folder.mkdir(parents=True, exist_ok=True)
-        output_labels_folder.mkdir(parents=True, exist_ok=True)
-
-        # Save the augmented image in the images folder
-        output_img_path = output_images_folder / f"{img_name.replace('.png', '_aug.png')}"
-        cv2.imwrite(str(output_img_path), img_aug)
-
-        # Save the augmented labels in the labels folder
-        output_label_path = output_labels_folder / f"{label_name.replace('.txt', '_aug.txt')}"
-        with open(output_label_path, 'w') as f:
-            for label in new_labels:
-                cls, x1, y1, x2, y2 = label
-                xc = (x1 + x2) / 2 / w
-                yc = (y1 + y2) / 2 / h
-                bw = (x2 - x1) / w
-                bh = (y2 - y1) / h
-                f.write(f"{cls} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}\n")
+        # # Save the augmented image in the images folder
+        # output_img_path = output_images_folder / f"{img_name.replace('.png', '_aug.png')}"
+        # cv2.imwrite(str(output_img_path), img_aug)
+        #
+        # # Save the augmented labels in the labels folder
+        # output_label_path = output_labels_folder / f"{label_name.replace('.txt', '_aug.txt')}"
+        # with open(output_label_path, 'w') as f:
+        #     for label in new_labels:
+        #         cls, x1, y1, x2, y2 = label
+        #         xc = (x1 + x2) / 2 / w
+        #         yc = (y1 + y2) / 2 / h
+        #         bw = (x2 - x1) / w
+        #         bh = (y2 - y1) / h
+        #         f.write(f"{cls} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}\n")
 
 
 # call main function
