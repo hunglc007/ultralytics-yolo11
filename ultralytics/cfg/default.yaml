@@ -109,7 +109,7 @@ translate: 0.0 # (float) image translation (+/- fraction)
 scale: 0.5 # (float) image scale (+/- gain)
 shear: 0.0 # (float) image shear (+/- deg)
 perspective: 0.0 # (float) image perspective (+/- fraction), range 0-0.001
-flipud: 0.25 # (float) image flip up-down (probability)
+flipud: 0.1 # (float) image flip up-down (probability)
 fliplr: 0.25 # (float) image flip left-right (probability)
 bgr: 0.0 # (float) image channel BGR (probability)
 mosaic: 1.0 # (float) image mosaic (probability)
