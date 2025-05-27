@@ -531,6 +531,7 @@ class Replace(BaseMixTransform):
         pool = self.object_index.get(cam_id + "_" + time_seg, [])
         center = int(index)
         pool_indices = [p[-1] for p in pool]
+        if len(pool_indices) == 0: return []
         max_pool_idx = max(pool_indices)
         min_pool_idx = min(pool_indices)
         min_idx = max(min_pool_idx, center - 50)
@@ -2688,6 +2689,8 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
             CutMix(dataset, pre_transform=pre_transform, p=hyp.cutmix),
             Albumentations(p=1.0),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
+            RandomFlip(direction="vertical", p=hyp.flipud),
+            RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
         ]
     )  # transforms
 
